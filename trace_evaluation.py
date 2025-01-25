@@ -1,127 +1,106 @@
+import pandas as pd
 import json
-import numpy as np
-import matplotlib.pyplot as plt
-from collections import defaultdict
 
 
-def span_duration_distribution_by_service(file_path):
+def load_traces_from_file(filepath):
+    data = []
     try:
-        # JSON-Datei einlesen
-        with open(file_path, 'r') as file:
-            data = json.load(file)
-
-        service_durations = defaultdict(list)
-
-        # Über alle Traces iterieren
-        for trace in data.get('data', []):
-            for span in trace.get('spans', []):
-                # Extrahiere ServiceName und Dauer des Spans
-                service_name = span.get('process', {}).get(
-                    'serviceName', 'Unbekannt')
-                duration = span.get('duration')
-                if duration is not None:
-                    service_durations[service_name].append(
-                        duration / 1000.0)  # In Millisekunden
-
-        # Erstelle Histogramme für jeden Service
-        for service, durations in service_durations.items():
-            plt.figure(figsize=(10, 5))
-            plt.hist(durations, bins=30, alpha=0.7, label=f"{service}")
-            plt.title(f"Verteilung der Span-Durchlaufzeiten für {service}")
-            plt.xlabel("Dauer (in Millisekunden)")
-            plt.ylabel("Häufigkeit")
-            plt.legend()
-            plt.show()
-
-    except Exception as e:
-        print(f"Fehler beim Verarbeiten der Datei: {e}")
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                data.append(json.loads(line.strip()))
+        return pd.DataFrame(data)
+    except FileNotFoundError:
+        print(f"Datei {filepath} wurde nicht gefunden.")
+        return pd.DataFrame()
+    except json.JSONDecodeError as e:
+        print(f"Fehler beim lesen der Datei {filepath}: {e}")
+        return pd.DataFrame()
 
 
-def calculate_trace_durations_with_plots(file_path):
-    try:
-        # JSON-Datei einlesen
-        with open(file_path, 'r') as file:
-            data = json.load(file)
+def merge_and_calculate_trace_durations(filepaths, time_window_minutes=None):
+    """
+    Kombiniert die Traces aus mehreren Dateien, berechnet die Gesamtdurchlaufzeit pro Trace,
+    filtert optional nach einer Zeitspanne und berechnet den Mittelwert mit und ohne Ausreißer.
 
-        trace_durations = []
-        trace_count = len(data.get('data', []))
+    :param filepaths: Liste von Datei-Pfaden zu den Trace-Dateien
+    :param time_window_minutes: Zeitspanne in Minuten (ab Startzeit des ersten Traces), optional
+    :return: dict mit durchschnittlicher Durchlaufzeit, Anzahl der Traces,
+             durchschnittlicher Durchlaufzeit ohne Ausreißer und Anzahl der Traces ohne Ausreißer.
+    """
+    # Lade alle Dateien in separate DataFrames
+    dfs = [load_traces_from_file(filepath) for filepath in filepaths]
 
-        # Über alle Traces iterieren
-        for trace in data.get('data', []):
-            if 'spans' in trace:
-                # Die Dauer des gesamten Traces berechnen (basierend auf Startzeit und Endzeit der Spans)
-                start_times = [span.get('startTime')
-                               for span in trace['spans'] if 'startTime' in span]
-                end_times = [span.get('startTime', 0) + span.get('duration', 0)
-                             for span in trace['spans'] if 'startTime' in span and 'duration' in span]
+    # Kombiniere alle DataFrames in einen
+    combined_df = pd.concat(dfs, ignore_index=True)
 
-                if start_times and end_times:
-                    # In Millisekunden
-                    trace_duration = (
-                        max(end_times) - min(start_times)) / 1000.0
-                    trace_durations.append(trace_duration)
+    # Konvertiere Start- und Endzeitspalten zu numerischen Werten
+    combined_df["startTimeUnixNano"] = pd.to_numeric(
+        combined_df["startTimeUnixNano"], errors="coerce")
+    combined_df["endTimeUnixNano"] = pd.to_numeric(
+        combined_df["endTimeUnixNano"], errors="coerce")
 
-        if not trace_durations:
-            print("Keine Traces mit berechenbarer Dauer gefunden.")
-            return
+    # Fehlende Werte entfernen
+    combined_df = combined_df.dropna(
+        subset=["startTimeUnixNano", "endTimeUnixNano"])
 
-        # Durchschnittliche Dauer mit Ausreißern berechnen
-        average_trace_duration_with_outliers = sum(
-            trace_durations) / len(trace_durations)
+    # Gruppiere nach traceId und berechne die Gesamtdurchlaufzeit
+    trace_durations = combined_df.groupby("traceId").apply(
+        lambda group: {
+            "start_time": group["startTimeUnixNano"].min(),
+            "end_time": group["endTimeUnixNano"].max(),
+            "duration_ns": group["endTimeUnixNano"].max() - group["startTimeUnixNano"].min()
+        }
+    )
 
-        # Ausreißer mit der IQR-Methode entfernen
-        q1 = np.percentile(trace_durations, 25)
-        q3 = np.percentile(trace_durations, 75)
-        iqr = q3 - q1
-        lower_bound = q1 - 1.5 * iqr
-        upper_bound = q3 + 1.5 * iqr
+    # Umwandeln in DataFrame
+    result_df = pd.DataFrame([
+        {"traceId": trace_id, **values}
+        for trace_id, values in trace_durations.items()
+    ])
 
-        # Filtere die Daten
-        filtered_trace_durations = [
-            d for d in trace_durations if lower_bound <= d <= upper_bound]
+    # Optional: Dauer in Millisekunden hinzufügen
+    result_df["duration_ms"] = result_df["duration_ns"] / 1e6
 
-        # Durchschnitt berechnen (nach dem Entfernen von Ausreißern)
-        if not filtered_trace_durations:
-            print("Keine Daten übrig nach Entfernung der Ausreißer.")
-            return
+    # Optional: Traces innerhalb der Zeitspanne filtern
+    if time_window_minutes is not None:
+        # Zeitfenster in Nanosekunden
+        time_window_ns = time_window_minutes * 60 * 1e9
 
-        average_trace_duration_without_outliers = sum(
-            filtered_trace_durations) / len(filtered_trace_durations)
+        # Früheste Startzeit des ersten Traces
+        earliest_start_time = result_df["start_time"].min()
 
-        print(f"Anzahl der Traces: {trace_count}")
-        print(
-            f"Anzahl der ursprünglichen Trace-Durchlaufzeiten: {len(trace_durations)}")
-        print(
-            f"Anzahl der Trace-Durchlaufzeiten nach Entfernung von Ausreißern: {len(filtered_trace_durations)}")
-        print(
-            f"Durchschnittliche Trace-Durchlaufzeit mit Ausreißern: {average_trace_duration_with_outliers:.2f} Millisekunden")
-        print(
-            f"Durchschnittliche Trace-Durchlaufzeit ohne Ausreißer: {average_trace_duration_without_outliers:.2f} Millisekunden")
+        # Filtere Traces, die innerhalb der Zeitspanne liegen
+        result_df = result_df[
+            result_df["start_time"] <= (earliest_start_time + time_window_ns)
+        ]
 
-        # Schaubilder erstellen
-        # 1. Boxplot der Trace-Durchlaufzeiten
-        plt.figure(figsize=(10, 5))
-        plt.boxplot(trace_durations, vert=False, patch_artist=True)
-        plt.title("")
-        plt.xlabel("Dauer (in Millisekunden)")
-        plt.show()
+    # Anzahl der Traces im Zeitfenster
+    num_traces_in_window = len(result_df)
 
-        # 2. Histogramm vor und nach Ausreißerentfernung
-        plt.figure(figsize=(10, 5))
-        plt.hist(trace_durations, bins=30, alpha=0.7, label="Originaldaten")
-        plt.hist(filtered_trace_durations, bins=30,
-                 alpha=0.7, label="Nach Ausreißerentfernung")
-        plt.title("Histogramm der Trace-Durchlaufzeiten")
-        plt.xlabel("Dauer (in Millisekunden)")
-        plt.ylabel("Häufigkeit")
-        plt.legend()
-        plt.show()
+    # Berechne die durchschnittliche Durchlaufzeit
+    average_duration_ms = round(result_df["duration_ms"].mean(), 2)
 
-    except Exception as e:
-        print(f"Fehler beim Verarbeiten der Datei: {e}")
+    # Berechne den Mittelwert ohne Ausreißer (IQR-Methode)
+    q1 = result_df["duration_ms"].quantile(0.25)  # 1. Quartil
+    q3 = result_df["duration_ms"].quantile(0.75)  # 3. Quartil
+    iqr = q3 - q1  # Interquartilsabstand
 
+    # Filter für Werte innerhalb von [Q1 - 1.5*IQR, Q3 + 1.5*IQR]
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+    filtered_durations = result_df[(result_df["duration_ms"] >= lower_bound) &
+                                   (result_df["duration_ms"] <= upper_bound)]
 
-# Pfad zur hochgeladenen Datei
-file_path = "data/1S_10_25.json"
-calculate_trace_durations_with_plots(file_path)
-# span_duration_distribution_by_service(file_path)
+    # Mittelwert ohne Ausreißer
+    average_duration_no_outliers = round(
+        filtered_durations["duration_ms"].mean(), 2)
+
+    # Anzahl der Traces ohne Ausreißer
+    num_traces_no_outliers = len(filtered_durations)
+
+    return {
+        "average_duration_ms": average_duration_ms,
+        "num_traces_in_window": num_traces_in_window,
+        "average_duration_no_outliers": average_duration_no_outliers,
+        "num_traces_no_outliers": num_traces_no_outliers
+    }
